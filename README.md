@@ -36,6 +36,7 @@ Architecture, failure modes and sizing are in **[docs/ARCHITECTURE.md](docs/ARCH
 | `deploy/clickhouse/001_schema.sql` | Warehouse DDL (embedded into the worker for dev bootstrap) |
 | `deploy/k8s/etl-worker.yaml` | AKS Deployment, PDB, KEDA lag-based autoscaling |
 | `scripts/benchmark.sh` | End-to-end throughput benchmark with the real worker binary |
+| `scripts/chaos-soak.sh` | Peak-rate soak with injected ClickHouse, Kafka and worker failures, plus exactness checks |
 | `azure-pipelines.yml` | CI: build, unit + integration tests, image push |
 
 ## Run it locally
@@ -122,12 +123,40 @@ an exact warehouse count, all invalid records in the DLQ, and every offset commi
 | Scale-out then scale-in rebalance under back-pressure | 23 / 23 after the fix (failed ~1 in 7 before; see ARCHITECTURE.md) |
 | Gzip NDJSON file backfill | 4 / 4 |
 
+### Chaos soak (`scripts/chaos-soak.sh`)
+
+8 minutes of live traffic at 58k rec/s (5× the 1B/day average) through two workers, with five failures
+injected on a schedule. **Result: PASS. Every record is accounted for, with no loss and no duplicates.**
+
+| Injected at | Failure | Observed |
+|---|---|---|
+| 60 s | Second worker joins (rebalance under load) | No stall |
+| 120 s | ClickHouse restarted | A few retried inserts, no stall |
+| 200 s | Worker killed with SIGKILL, restarted 15 s later | ~40 s stall until Kafka's `session.timeout.ms` (45 s) expired the dead member, then caught up at ~100k rec/s |
+| 290 s | ClickHouse frozen for 45 s (inserts hang and time out) | Back-pressure; backlog peaked at 3.6M records, cleared ~30 s after the thaw |
+| 380 s | Kafka broker restarted (source, DLQ and producer all disconnected) | Reconnected automatically, no stall |
+
+| Check | Result |
+|---|---|
+| Events (27.84M produced) | expected 27,422,974 = unique 27,422,974 = `FINAL` 27,422,974 |
+| Dead letters | 138,633 invalid generated = 138,633 distinct in DLQ (no replays needed) |
+| Latest-status view | 1,999,999 rows = 1,999,999 distinct waybills |
+| Caught up after traffic stopped | 10 s; consumer lag 0, all offsets committed |
+| Workers | max RSS 2.1 GB during catch-up, both exited 0 on SIGTERM, no crashes |
+| ClickHouse active parts | max 23, settled to 8 (merges keep up) |
+
+The hourly rollup came out 0.5% high (27.56M) because of rows replayed after the SIGKILL. That's expected and
+documented: use `FINAL` for exact counts. To fail over faster after a hard crash, lower
+`Etl__Kafka__ConsumerConfig__session.timeout.ms`; the trade-off is more false evictions during long GC or
+network pauses.
+
 Reproduce:
 
 ```bash
 dotnet run -c Release --project bench/EventingC3.Etl.Benchmarks -- 2000000
 RECORDS=10000000 PARTITIONS=12 ./scripts/benchmark.sh
 RATE=58000 RECORDS=7000000 PARTITIONS=12 ./scripts/benchmark.sh
+DURATION=480 RATE=58000 ./scripts/chaos-soak.sh     # needs containers "ch" and "rp" on the host network
 ```
 
 ### What these numbers do and don't show
