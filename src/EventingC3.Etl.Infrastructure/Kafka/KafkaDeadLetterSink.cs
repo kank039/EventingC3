@@ -14,6 +14,7 @@ public sealed class KafkaDeadLetterSink : IDeadLetterSink, IDisposable
 {
     private readonly KafkaDeadLetterOptions _options;
     private readonly IProducer<Null, byte[]> _producer;
+    private int _disposed;
 
     public KafkaDeadLetterSink(KafkaDeadLetterOptions options, KafkaSourceOptions source)
     {
@@ -85,6 +86,11 @@ public sealed class KafkaDeadLetterSink : IDeadLetterSink, IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         _producer.Flush(TimeSpan.FromSeconds(10));
         _producer.Dispose();
     }

@@ -1,0 +1,101 @@
+# EventingC3 ETL worker on AKS, scaled by consumer lag with KEDA.
+#
+# Sizing (see docs/ARCHITECTURE.md): 1B events/day ≈ 11.6k/s average; one 2-vCPU worker sustains well above the
+# worst-case peak, so replicas are for availability and backlog catch-up, not baseline throughput.
+# maxReplicaCount must not exceed the partition count (extra consumers sit idle).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eventingc3-etl
+data:
+  Etl__Kafka__BootstrapServers: "ram-eventing.servicebus.windows.net:9093"   # Event Hubs Kafka endpoint
+  Etl__Kafka__Topic: "tracking-events"
+  Etl__Kafka__GroupId: "eventingc3-etl"
+  Etl__Kafka__ConsumerConfig__security.protocol: "SASL_SSL"
+  Etl__Kafka__ConsumerConfig__sasl.mechanism: "PLAIN"
+  Etl__Kafka__ConsumerConfig__sasl.username: "$ConnectionString"
+  Etl__DeadLetterKafka__Topic: "tracking-events.dlq"
+  Etl__ClickHouse__Endpoint: "http://clickhouse-eventing.clickhouse.svc.cluster.local:8123"
+  Etl__ClickHouse__Database: "eventing"
+  Etl__ClickHouse__Table: "tracking_events"           # use the Distributed table on a sharded cluster
+  Etl__ClickHouse__Settings__insert_quorum: "2"       # replicated cluster: ack only when 2 replicas have the part
+  Etl__ClickHouse__ApplySchemaOnStartup: "false"      # schema is applied by migrations, not by workers
+  Etl__Pipeline__MaxBatchRecords: "100000"
+  Etl__Pipeline__MaxConcurrentBatches: "4"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eventingc3-etl
+  labels: { app: eventingc3-etl }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: eventingc3-etl }
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app: eventingc3-etl }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 60      # > Pipeline.ShutdownGracePeriod (25s) + final commit
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: eventingc3-etl }
+      containers:
+        - name: etl
+          image: ramacr.azurecr.io/eventingc3-etl:latest
+          ports: [{ containerPort: 8080, name: http }]
+          envFrom: [{ configMapRef: { name: eventingc3-etl } }]
+          env:
+            - name: Etl__Kafka__ConsumerConfig__sasl.password
+              valueFrom: { secretKeyRef: { name: eventingc3-etl, key: eventhubs-connection-string } }
+            - name: Etl__ClickHouse__Password
+              valueFrom: { secretKeyRef: { name: eventingc3-etl, key: clickhouse-password } }
+          resources:
+            requests: { cpu: "2", memory: 2Gi }
+            limits: { memory: 4Gi }   # ~MaxConcurrentBatches × MaxBatchBytes × 3 plus librdkafka buffers
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 10
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: eventingc3-etl
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: eventingc3-etl }
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: eventingc3-etl
+spec:
+  scaleTargetRef: { name: eventingc3-etl }
+  minReplicaCount: 2
+  maxReplicaCount: 32            # = partition count
+  cooldownPeriod: 300
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: ram-eventing.servicebus.windows.net:9093
+        consumerGroup: eventingc3-etl
+        topic: tracking-events
+        lagThreshold: "500000"   # ~10 s of work per replica at the measured drain rate
+        offsetResetPolicy: earliest
+        sasl: plaintext
+        tls: enable
+      authenticationRef: { name: eventingc3-etl-kafka }

@@ -1,0 +1,55 @@
+# Azure DevOps CI: build, unit tests, integration tests against real ClickHouse + Kafka (Redpanda), container image.
+trigger:
+  branches: { include: [main, release/*] }
+pr:
+  branches: { include: [main] }
+
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+  buildConfiguration: Release
+
+stages:
+  - stage: Build
+    jobs:
+      - job: Test
+        steps:
+          - task: UseDotNet@2
+            inputs: { packageType: sdk, version: 10.0.x }
+          - script: dotnet build EventingC3.slnx -c $(buildConfiguration)
+            displayName: Build
+          - script: dotnet test tests/EventingC3.Etl.Tests -c $(buildConfiguration) --no-build --logger trx --results-directory $(Agent.TempDirectory)/unit
+            displayName: Unit tests
+          - script: docker compose up -d redpanda clickhouse && ./scripts/wait-for-stack.sh
+            displayName: Start ClickHouse + Kafka
+          - script: dotnet test tests/EventingC3.Etl.IntegrationTests -c $(buildConfiguration) --no-build --logger trx --results-directory $(Agent.TempDirectory)/it
+            displayName: Integration tests
+            env:
+              ETL_IT: "1"
+              ETL_IT_KAFKA: localhost:19092
+          - task: PublishTestResults@2
+            condition: always()
+            inputs: { testResultsFormat: VSTest, testResultsFiles: "$(Agent.TempDirectory)/**/*.trx" }
+          - script: docker compose down -v
+            condition: always()
+            displayName: Stop stack
+
+  - stage: Image
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: Docker
+        steps:
+          - task: Docker@2
+            inputs:
+              command: buildAndPush
+              containerRegistry: ramacr
+              repository: eventingc3-etl
+              Dockerfile: src/EventingC3.Etl.Worker/Dockerfile
+              buildContext: .
+              tags: |
+                $(Build.BuildNumber)
+                latest

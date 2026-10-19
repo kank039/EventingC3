@@ -1,0 +1,63 @@
+# Local stack: Kafka-compatible broker (Redpanda), ClickHouse and two ETL workers sharing one consumer group.
+#
+#   docker compose up -d --build
+#   docker compose --profile load run --rm loadgen          # push 1M synthetic events
+#   curl -s localhost:8081/metrics | grep etl_records
+#   docker compose exec clickhouse clickhouse-client -q "SELECT count() FROM eventing.tracking_events FINAL"
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.18
+    command:
+      - redpanda start --mode dev-container --smp 1 --memory 2G --overprovisioned
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports: ["19092:19092"]
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "--exit-when-healthy"]
+      interval: 5s
+      retries: 30
+
+  topics:
+    image: redpandadata/redpanda:v24.2.18
+    depends_on: { redpanda: { condition: service_healthy } }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - rpk topic create tracking-events -p 12 -X brokers=redpanda:9092 || true;
+        rpk topic create tracking-events.dlq -p 3 -X brokers=redpanda:9092 || true
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ports: ["8123:8123"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 5s
+      retries: 30
+
+  etl:
+    build:
+      context: .
+      dockerfile: src/EventingC3.Etl.Worker/Dockerfile
+    image: eventingc3-etl:local
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      topics: { condition: service_completed_successfully }
+    environment:
+      Etl__Kafka__BootstrapServers: redpanda:9092
+      Etl__ClickHouse__Endpoint: http://clickhouse:8123
+      Etl__ClickHouse__ApplySchemaOnStartup: "true"
+    deploy:
+      replicas: 2
+    ports: ["8081-8082:8080"]
+    stop_grace_period: 45s
+
+  loadgen:
+    profiles: ["load"]
+    image: mcr.microsoft.com/dotnet/sdk:10.0
+    working_dir: /src
+    volumes: [".:/src"]
+    depends_on: { topics: { condition: service_completed_successfully } }
+    command: >
+      dotnet run -c Release --project tools/EventingC3.LoadGen --
+      --bootstrap redpanda:9092 --topic tracking-events --count 1000000

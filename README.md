@@ -1,0 +1,103 @@
+# EventingC3 — Tracking-event ETL (1B records/day)
+
+A .NET 10 ETL worker that streams RAM consignment tracking events from **Kafka / Azure Event Hubs** (or
+NDJSON bulk files from SFTP drops) into **ClickHouse**. It validates, normalises and enriches each record and
+loads them idempotently. The design target is 1 billion records/day under worst-case conditions: bursts,
+malformed input, duplicates, warehouse outages, crashes and rebalances.
+
+```
+Kafka / Event Hubs ─┐                                     ┌─▶ ClickHouse tracking_events (+ latest-status & hourly MVs)
+                    ├─▶ batch ─▶ parse/validate/enrich ─▶ ┤
+NDJSON(.gz) files ──┘   (back-pressured, bounded memory)  └─▶ dead-letter topic / files (original bytes + reason)
+```
+
+Architecture, failure modes and sizing are in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
+## Why this stack
+
+* **.NET 10 worker**: RAM's backend standard. One process sustains several times the 1B/day average rate,
+  so a Spark/Flink cluster would only add operational cost.
+* **Kafka protocol**: works unchanged against Azure Event Hubs (Kafka endpoint) and plain Kafka/Redpanda.
+  The partition is the unit of scale-out and ordering (keyed by waybill).
+* **ClickHouse** is RAM's analytical store. The worker sends `RowBinary` over HTTP (cheapest server-side
+  ingest), as one large atomic insert per batch, using `ReplacingMergeTree` with monthly partitions.
+
+## Repository layout
+
+| Path | What |
+|---|---|
+| `src/EventingC3.Etl.Core` | Domain, parser/validator, RowBinary encoder, batching, offset tracking, pipeline, metrics |
+| `src/EventingC3.Etl.Infrastructure` | Kafka source + DLQ, ClickHouse HTTP sink, file source + DLQ |
+| `src/EventingC3.Etl.Worker` | Host: configuration, `/healthz`, `/readyz`, `/metrics`, Dockerfile |
+| `tools/EventingC3.LoadGen` | Synthetic, deliberately messy load (invalid, duplicate and id-less events) for Kafka or files |
+| `bench/EventingC3.Etl.Benchmarks` | CPU micro-benchmark of the transform stage |
+| `tests/EventingC3.Etl.Tests` | Unit tests (parser fuzzing, encoding, batching, retries, bisection, offset safety) |
+| `tests/EventingC3.Etl.IntegrationTests` | Against real ClickHouse + Kafka: round-trip, idempotency, crash, outage, rebalance, backfill |
+| `deploy/clickhouse/001_schema.sql` | Warehouse DDL (embedded into the worker for dev bootstrap) |
+| `deploy/k8s/etl-worker.yaml` | AKS Deployment, PDB, KEDA lag-based autoscaling |
+| `scripts/benchmark.sh` | End-to-end throughput benchmark with the real worker binary |
+| `azure-pipelines.yml` | CI: build, unit + integration tests, image push |
+
+## Run it locally
+
+```bash
+docker compose up -d --build                      # Redpanda, ClickHouse, 2 ETL workers
+docker compose --profile load run --rm loadgen    # 1M synthetic events
+curl -s localhost:8081/metrics | grep etl_records
+docker compose exec clickhouse clickhouse-client -q \
+  "SELECT event_type, count() FROM eventing.tracking_events FINAL GROUP BY event_type"
+```
+
+Without Docker for the worker:
+
+```bash
+dotnet run --project src/EventingC3.Etl.Worker    # uses appsettings.json (localhost:9092 / localhost:8123)
+```
+
+Bulk backfill from files:
+
+```bash
+dotnet run -c Release --project tools/EventingC3.LoadGen -- --out ./data/inbox --files 4 --count 1000000
+Etl__Source=File Etl__DeadLetter=File Etl__Files__StopWhenIdle=true dotnet run --project src/EventingC3.Etl.Worker
+```
+
+## Configuration
+
+All settings live under `Etl` in `appsettings.json` and can be overridden with environment variables
+(`Etl__Pipeline__MaxBatchRecords=200000`). The main ones:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `Source` / `DeadLetter` | `Kafka` | `Kafka` or `File` |
+| `Pipeline:MaxBatchRecords` | 100,000 | ≤ 1,000,000 so each insert stays one atomic ClickHouse block |
+| `Pipeline:MaxBatchLatency` | 2 s | Bounds latency when traffic is low |
+| `Pipeline:MaxConcurrentBatches` | 4 | Parallel transform/load; memory ≈ this × MaxBatchBytes × 3 |
+| `Pipeline:RetryMaxDelay` | 30 s | Retries never give up. The pipeline stalls instead of dropping data |
+| `Transform:MaxEventAge` | 30 days | Older events go to the DLQ; raise it for backfills |
+| `Transform:DefaultUtcOffset` | +02:00 | Applied to timestamps without a zone (SAST) |
+| `Kafka:ConsumerConfig` | — | Raw librdkafka overrides (SASL for Event Hubs, etc.) |
+| `ClickHouse:Compression` | `none` | `gzip`/`br` for cross-zone links |
+| `ClickHouse:Settings` | — | Extra insert settings, e.g. `insert_quorum` |
+
+Event Hubs example:
+
+```bash
+Etl__Kafka__BootstrapServers=<namespace>.servicebus.windows.net:9093
+Etl__Kafka__ConsumerConfig__security.protocol=SASL_SSL
+Etl__Kafka__ConsumerConfig__sasl.mechanism=PLAIN
+Etl__Kafka__ConsumerConfig__sasl.username='$ConnectionString'
+Etl__Kafka__ConsumerConfig__sasl.password='<connection string>'
+```
+
+## Tests
+
+```bash
+dotnet test tests/EventingC3.Etl.Tests                          # unit tests, no dependencies
+
+docker compose up -d redpanda clickhouse                        # integration tests need the real services
+ETL_IT=1 ETL_IT_KAFKA=localhost:19092 dotnet test tests/EventingC3.Etl.IntegrationTests
+```
+
+## Benchmark results
+
+BENCHMARK_RESULTS_PLACEHOLDER

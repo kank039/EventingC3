@@ -1,11 +1,5 @@
-using EventingC3.Etl.Core.Abstractions;
-using EventingC3.Etl.Core.Domain;
 using EventingC3.Etl.Core.Observability;
 using EventingC3.Etl.Core.Pipeline;
-using EventingC3.Etl.Core.Transform;
-using EventingC3.Etl.Infrastructure.ClickHouse;
-using EventingC3.Etl.Infrastructure.Files;
-using EventingC3.Etl.Infrastructure.Kafka;
 using EventingC3.Etl.Worker;
 
 var builder = WebApplication.CreateSlimBuilder(args);
@@ -20,46 +14,8 @@ builder.Services.Configure<HostOptions>(o =>
     o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.StopHost;
 });
 
-var services = builder.Services;
-services.AddSingleton(settings);
-services.AddSingleton(settings.Pipeline);
-services.AddSingleton(settings.Transform);
-services.AddSingleton(settings.ClickHouse);
-services.AddSingleton(TimeProvider.System);
-services.AddSingleton<EtlMetrics>();
-services.AddSingleton<EtlHealth>();
-services.AddSingleton(settings.HubRegions.Count > 0 ? new HubDirectory(settings.HubRegions) : HubDirectory.Default);
-services.AddSingleton<TrackingEventParser>();
-services.AddSingleton<ClickHouseSink>();
-services.AddSingleton<IEventSink>(sp => sp.GetRequiredService<ClickHouseSink>());
-
-if (settings.Source == "File")
-{
-    services.AddSingleton(settings.Files);
-    services.AddSingleton<IRecordSource, FileRecordSource>();
-}
-else
-{
-    services.AddSingleton(settings.Kafka);
-    services.AddSingleton<IRecordSource, KafkaRecordSource>();
-}
-
-if (settings.DeadLetter == "File")
-{
-    services.AddSingleton(settings.DeadLetterFiles);
-    services.AddSingleton<IDeadLetterSink, FileDeadLetterSink>();
-}
-else
-{
-    services.AddSingleton(settings.DeadLetterKafka);
-    services.AddSingleton(sp => new KafkaDeadLetterSink(settings.DeadLetterKafka, settings.Kafka));
-    services.AddSingleton<IDeadLetterSink>(sp => sp.GetRequiredService<KafkaDeadLetterSink>());
-}
-
-services.AddSingleton<Batcher>();
-services.AddSingleton<BatchProcessor>();
-services.AddSingleton<EtlPipeline>();
-services.AddHostedService<EtlWorkerService>();
+builder.Services.AddEtlPipeline(settings);
+builder.Services.AddHostedService<EtlWorkerService>();
 
 var app = builder.Build();
 
