@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.13" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="EventingC3.Etl.Tests" />
+    <InternalsVisibleTo Include="EventingC3.Etl.Benchmarks" />
+  </ItemGroup>
+
+</Project>

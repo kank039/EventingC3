@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\EventingC3.Etl.Core\EventingC3.Etl.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Confluent.Kafka" Version="2.16.0" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.13" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Single source of truth for the warehouse DDL. -->
+    <EmbeddedResource Include="..\..\deploy\clickhouse\001_schema.sql" LogicalName="EventingC3.Etl.Infrastructure.ClickHouse.001_schema.sql" Link="ClickHouse\001_schema.sql" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="EventingC3.Etl.Tests" />
+    <InternalsVisibleTo Include="EventingC3.Etl.IntegrationTests" />
+  </ItemGroup>
+
+</Project>
