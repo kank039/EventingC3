@@ -94,7 +94,7 @@ public sealed class ClickHouseSink : IEventSink, IDisposable
         {
             throw new SinkException(SinkErrorKind.Transient, $"Insert timed out after {_options.RequestTimeout}", ex);
         }
-        catch (HttpRequestException ex)
+        catch (Exception ex) when (ex is HttpRequestException or IOException or System.Net.Sockets.SocketException)
         {
             throw new SinkException(SinkErrorKind.Transient, $"ClickHouse unreachable: {ex.Message}", ex);
         }

@@ -54,11 +54,13 @@ public sealed class RawBatch
     }
 
     /// <summary>
-    /// A token identifying this batch's exact source ranges. Passed to ClickHouse as
-    /// <c>insert_deduplication_token</c>, so retrying an insert whose outcome is unknown (timeout, dropped
-    /// connection) can never write the rows twice.
+    /// A stable fingerprint of this batch's exact source ranges (input to the insert deduplication token).
     /// </summary>
-    public string DeduplicationToken()
+    /// <remarks>
+    /// Not a token on its own: two batches can cover identical ranges yet carry different rows (e.g. a worker that
+    /// lost the partition mid-batch inserted only part of it). See <see cref="BatchProcessor"/>.
+    /// </remarks>
+    public string SourceFingerprint()
     {
         var sb = new StringBuilder(64 * _segments.Count);
         foreach (var segment in _segments.Values.OrderBy(s => s.Lease.Source, StringComparer.Ordinal).ThenBy(s => s.Lease.Partition))

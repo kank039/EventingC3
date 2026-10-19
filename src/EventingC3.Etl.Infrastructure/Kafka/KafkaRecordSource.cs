@@ -33,6 +33,7 @@ public sealed class KafkaRecordSource : IRecordSource, IDisposable
     private readonly Queue<RawRecord> _overflow = new();
     private IConsumer<Ignore, byte[]>? _consumer;
     private Task? _loop;
+    private volatile bool _assignmentChanged;
 
     public KafkaRecordSource(KafkaSourceOptions options, EtlMetrics metrics, ILogger<KafkaRecordSource> logger)
     {
@@ -121,8 +122,11 @@ public sealed class KafkaRecordSource : IRecordSource, IDisposable
                     continue;
                 }
 
-                if (paused)
+                if (paused || _assignmentChanged)
                 {
+                    // librdkafka keeps a partition's pause flag across revoke/re-assign, so a partition paused for
+                    // back-pressure, revoked, then handed back would otherwise never be fetched again.
+                    _assignmentChanged = false;
                     SafeResume(consumer);
                     paused = false;
                 }
@@ -255,6 +259,7 @@ public sealed class KafkaRecordSource : IRecordSource, IDisposable
                     });
                 }
 
+                _assignmentChanged = true;
                 _logger.LogInformation("Assigned {Partitions}", string.Join(",", partitions.Select(p => p.Partition.Value)));
             })
             .SetPartitionsRevokedHandler((consumer, partitions) =>
@@ -263,6 +268,7 @@ public sealed class KafkaRecordSource : IRecordSource, IDisposable
                 // Commit what is already loaded while we still own the partitions, then stop tracking them.
                 CommitPending(consumer, revoked);
                 RevokeLeases(revoked);
+                SafeResume(consumer, revoked); // do not carry a back-pressure pause into a future re-assignment
                 _logger.LogInformation("Revoked {Partitions}", string.Join(",", revoked.Select(p => p.Partition.Value)));
             })
             .SetPartitionsLostHandler((_, partitions) =>
@@ -323,11 +329,11 @@ public sealed class KafkaRecordSource : IRecordSource, IDisposable
         }
     }
 
-    private void SafeResume(IConsumer<Ignore, byte[]> consumer)
+    private void SafeResume(IConsumer<Ignore, byte[]> consumer, IEnumerable<TopicPartition>? partitions = null)
     {
         try
         {
-            consumer.Resume(consumer.Assignment);
+            consumer.Resume(partitions ?? consumer.Assignment);
         }
         catch (KafkaException ex)
         {

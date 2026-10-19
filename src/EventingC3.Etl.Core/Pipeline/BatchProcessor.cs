@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Security.Cryptography;
 using EventingC3.Etl.Core.Abstractions;
 using EventingC3.Etl.Core.Domain;
 using EventingC3.Etl.Core.Serialization;
@@ -63,7 +64,7 @@ public sealed class BatchProcessor
             if (events.Count > 0)
             {
                 using var encoded = Encode(events);
-                await LoadAsync(encoded, events, sourceIndex, batch, 0, events.Count, batch.DeduplicationToken(), rejects, cancellationToken)
+                await LoadAsync(encoded, events, sourceIndex, batch, 0, events.Count, batch.SourceFingerprint(), rejects, cancellationToken)
                     .ConfigureAwait(false);
             }
 
@@ -182,11 +183,12 @@ public sealed class BatchProcessor
         RawBatch batch,
         int fromRow,
         int toRow,
-        string token,
+        string fingerprint,
         List<DeadLetter> rejects,
         CancellationToken cancellationToken)
     {
         var rows = encoded.Slice(fromRow, toRow);
+        var token = InsertToken(fingerprint, events, fromRow, toRow);
         for (var attempt = 1; ; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -215,9 +217,9 @@ public sealed class BatchProcessor
                 var mid = fromRow + (toRow - fromRow) / 2;
                 _logger.LogWarning("Warehouse refused rows [{From},{To}) of batch {BatchId}; bisecting: {Error}",
                     fromRow, toRow, batch.Id, ex.Message);
-                await LoadAsync(encoded, events, sourceIndex, batch, fromRow, mid, $"{token}:{fromRow}-{mid}", rejects, cancellationToken)
+                await LoadAsync(encoded, events, sourceIndex, batch, fromRow, mid, fingerprint, rejects, cancellationToken)
                     .ConfigureAwait(false);
-                await LoadAsync(encoded, events, sourceIndex, batch, mid, toRow, $"{token}:{mid}-{toRow}", rejects, cancellationToken)
+                await LoadAsync(encoded, events, sourceIndex, batch, mid, toRow, fingerprint, rejects, cancellationToken)
                     .ConfigureAwait(false);
                 return;
             }
@@ -236,6 +238,31 @@ public sealed class BatchProcessor
                 await Task.Delay(delay, _time, cancellationToken).ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>
+    /// The <c>insert_deduplication_token</c> for rows [<paramref name="fromRow"/>, <paramref name="toRow"/>): a hash
+    /// of the batch's source ranges <em>and</em> the exact event ids being inserted.
+    /// </summary>
+    /// <remarks>
+    /// Retrying the identical insert reuses the token, so a write whose acknowledgement was lost is not applied twice.
+    /// Hashing the ids matters: Kafka hands out large single-partition chunks, so two workers can build batches over
+    /// identical offset ranges whose rows differ (one skipped records of a partition it lost mid-batch). With a
+    /// range-only token the server would discard the complete insert as a "duplicate" of the partial one — silent
+    /// data loss, reproduced by the rebalance integration test before this was fixed.
+    /// </remarks>
+    internal static string InsertToken(string fingerprint, IReadOnlyList<TrackingEvent> events, int fromRow, int toRow)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        hash.AppendData(System.Text.Encoding.UTF8.GetBytes(fingerprint));
+        Span<byte> id = stackalloc byte[16];
+        for (var i = fromRow; i < toRow; i++)
+        {
+            events[i].EventId.TryWriteBytes(id);
+            hash.AppendData(id);
+        }
+
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
     }
 
     // ---- Dead letters -------------------------------------------------------------------------------------------

@@ -137,6 +137,22 @@ public class BatchProcessorTests
     }
 
     [Fact]
+    public void Insert_token_covers_the_exact_rows_not_just_the_source_ranges()
+    {
+        TrackingEvent E(Guid id) => new() { EventId = id, Waybill = "RAM123456", EventType = "AT_HUB", OccurredAtUnixMs = 1 };
+        var a = E(Guid.NewGuid());
+        var b = E(Guid.NewGuid());
+
+        // Same ranges, same rows → same token (idempotent retry).
+        Assert.Equal(BatchProcessor.InsertToken("t:0:0-1", [a, b], 0, 2), BatchProcessor.InsertToken("t:0:0-1", [a, b], 0, 2));
+        // Same ranges, fewer rows (a worker skipped part of a revoked partition) → different token, so the complete
+        // insert by the new owner is not discarded as a duplicate.
+        Assert.NotEqual(BatchProcessor.InsertToken("t:0:0-1", [a, b], 0, 2), BatchProcessor.InsertToken("t:0:0-1", [a], 0, 1));
+        // Bisected halves get distinct tokens.
+        Assert.NotEqual(BatchProcessor.InsertToken("t:0:0-1", [a, b], 0, 1), BatchProcessor.InsertToken("t:0:0-1", [a, b], 1, 2));
+    }
+
+    [Fact]
     public async Task Skips_records_of_revoked_partitions()
     {
         var batch = Batch(Valid(1), Valid(2));

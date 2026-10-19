@@ -40,6 +40,9 @@ PARTITION BY toYYYYMM(occurred_at)
 ORDER BY (waybill, occurred_at, event_id)
 SETTINGS non_replicated_deduplication_window = 10000;
 
+-- MV target tables carry their own deduplication window: without it a retried insert that the source table
+-- deduplicates is still applied to the views (verified against ClickHouse 25.8 — counts doubled).
+
 -- Latest known status per consignment (the "where is my parcel" query), maintained on insert.
 CREATE TABLE IF NOT EXISTS consignment_latest_status
 (
@@ -51,7 +54,8 @@ CREATE TABLE IF NOT EXISTS consignment_latest_status
     event_id    UUID
 )
 ENGINE = ReplacingMergeTree(occurred_at)
-ORDER BY waybill;
+ORDER BY waybill
+SETTINGS non_replicated_deduplication_window = 10000;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS consignment_latest_status_mv TO consignment_latest_status AS
 SELECT waybill, event_type, occurred_at, hub_code, region, event_id
@@ -68,7 +72,8 @@ CREATE TABLE IF NOT EXISTS tracking_events_hourly
 )
 ENGINE = SummingMergeTree
 PARTITION BY toYYYYMM(hour)
-ORDER BY (hour, event_type, region);
+ORDER BY (hour, event_type, region)
+SETTINGS non_replicated_deduplication_window = 10000;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS tracking_events_hourly_mv TO tracking_events_hourly AS
 SELECT toStartOfHour(occurred_at) AS hour, event_type, region, count() AS events

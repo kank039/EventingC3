@@ -58,11 +58,11 @@ public class PartitionLeaseTests
         var first = Build();
         Assert.Equal(2, first.Segments.Count());
         Assert.Equal(4, first.Bytes);
-        Assert.Equal(Build().DeduplicationToken(), first.DeduplicationToken());
+        Assert.Equal(Build().SourceFingerprint(), first.SourceFingerprint());
 
         var other = new RawBatch(2, 1, DateTimeOffset.UtcNow);
         other.Add(new RawRecord([1], l0, 102));
-        Assert.NotEqual(first.DeduplicationToken(), other.DeduplicationToken());
+        Assert.NotEqual(first.SourceFingerprint(), other.SourceFingerprint());
     }
 }
 
