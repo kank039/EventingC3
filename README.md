@@ -100,4 +100,41 @@ ETL_IT=1 ETL_IT_KAFKA=localhost:19092 dotnet test tests/EventingC3.Etl.Integrati
 
 ## Benchmark results
 
-BENCHMARK_RESULTS_PLACEHOLDER
+Measured on a **single 4-vCPU / 15 GB sandbox VM running everything at once**: Redpanda (1 core), ClickHouse
+25.8, the load generator and **one** worker process. A production deployment gives each its own hardware, so
+treat these numbers as a floor.
+
+| Test | Result |
+|---|---|
+| Transform CPU cost (`bench/`) | 3.4 µs/record/core for parse + validate + enrich + encode → **291k rec/s on one core** (25× the 1B/day average) |
+| Backlog drain, 10M records, 12 partitions, 1 worker (`scripts/benchmark.sh`) | **130k rec/s average = 11.2 B records/day** per worker (11× target); exact result (9,850,635 unique = expected), no retries |
+| Sustained live traffic at 58k rec/s (5× the 1B/day average) for 2 min | Kept up; max lag ~4.7 s (batching latency), done 1.8 s after the last record was produced; exact result |
+| Container smoke test (published image) | 200k records: 196,034 loaded + 2,019 dead-lettered + 1,947 duplicates = 200,000; exact warehouse count; clean SIGTERM exit |
+
+Reliability tests run against the real services (`tests/EventingC3.Etl.IntegrationTests`), each ending with
+an exact warehouse count, all invalid records in the DLQ, and every offset committed:
+
+| Scenario | Runs |
+|---|---|
+| Steady stream (300k records with 2% invalid, 3% duplicates, 2% missing ids) | 4 / 4 |
+| Worker killed mid-stream, replacement resumes | 15 / 15 |
+| ClickHouse unplugged for 8 s mid-insert (TCP proxy cuts connections) | 4 / 4 |
+| Scale-out then scale-in rebalance under back-pressure | 23 / 23 after the fix (failed ~1 in 7 before; see ARCHITECTURE.md) |
+| Gzip NDJSON file backfill | 4 / 4 |
+
+Reproduce:
+
+```bash
+dotnet run -c Release --project bench/EventingC3.Etl.Benchmarks -- 2000000
+RECORDS=10000000 PARTITIONS=12 ./scripts/benchmark.sh
+RATE=58000 RECORDS=7000000 PARTITIONS=12 ./scripts/benchmark.sh
+```
+
+### What these numbers do and don't show
+
+* 1B/day is 11.6k rec/s on average. One worker on shared hardware sustains ~130k rec/s, so the cluster's
+  replicas are for availability and catch-up rather than raw throughput. A 6-hour backlog (~250M records at
+  peak mix) drains in ~30 min with one worker, or minutes with KEDA scaling to the partition count.
+* Not tested here: multi-day runs (ClickHouse merge behaviour at 30B rows/month), a replicated or sharded
+  ClickHouse cluster, and Azure Event Hubs itself (the Kafka protocol was tested against Redpanda). Do a
+  staging soak on the real Event Hubs + ClickHouse cluster before production cut-over.
